@@ -4,43 +4,69 @@
 
 from typing import Dict, List
 
-from adi.adrv9002 import rx1, rx2, tx1, tx2
 from adi.context_manager import context_manager
-from adi.obs import obs, remap, tx_two
-from adi.rx_tx import rx_tx
+from adi.rx_tx import are_channels_complex, rx_tx
 from adi.sync_start import sync_start
 
 
 def _map_to_dict(paths, ch):
-    if ch.attrs["label"].value == "buffer_only":
+    """
+    Align label parsing with ad9081.
+    Accepts either "FDDC->CDDC->ADC" or "side:FDDC->CDDC->ADC".
+    """
+    if "label" not in ch.attrs:
         return paths
-    side, fddc, cddc, adc = ch.attrs["label"].value.replace(":", "->").split("->")
-    if side not in paths.keys():
-        paths[side] = {}
-    if adc not in paths[side].keys():
-        paths[side][adc] = {}
-    if cddc not in paths[side][adc].keys():
-        paths[side][adc][cddc] = {}
-    if fddc not in paths[side][adc][cddc].keys():
-        paths[side][adc][cddc][fddc] = {"channels": [ch._id]}
+    lab = ch.attrs["label"].value
+    if lab == "buffer_only":
+        return paths
+
+    lab = lab.replace(":", "->")
+    parts = lab.split("->")
+    if len(parts) == 3:
+        fddc, cddc, adc = parts
+    elif len(parts) == 4:
+        _, fddc, cddc, adc = parts
     else:
-        paths[side][adc][cddc][fddc]["channels"].append(ch._id)
+        return paths
+
+    if adc not in paths:
+        paths[adc] = {}
+    if cddc not in paths[adc]:
+        paths[adc][cddc] = {}
+    if fddc not in paths[adc][cddc]:
+        paths[adc][cddc][fddc] = {"channels": [ch._id]}
+    else:
+        paths[adc][cddc][fddc]["channels"].append(ch._id)
     return paths
 
 
-def _sortconv(chans_names, noq=False, dds=False):
+def _sortconv(chans_names, noq=False, dds=False, complex=False):
+    """
+    Same sorting semantics as ad9081: interleave I/Q when complex,
+    sort by index, handle DDS altvoltage channels.
+    """
     tmpI = filter(lambda k: "_i" in k, chans_names)
     tmpQ = filter(lambda k: "_q" in k, chans_names)
 
-    def ignoreadc(w):
-        return int(w[len("voltage") : w.find("_")])
+    assert not (dds and complex), \
+        "DDS channels cannot have complex names (voltageX_i, voltageX_q)"
 
-    def ignorealt(w):
-        return int(w[len("altvoltage") :])
+    def ignoreadc(w):      # voltage{N}_i/_q
+        return int(w[len("voltage"): w.find("_")])
 
-    chans_names_out = []
+    def ignorealt(w):      # altvoltage{N}
+        return int(w[len("altvoltage"):])
+
+    def ignorevoltage(w):  # voltage{N}
+        return int(w[len("voltage"):])
+
+    out = []
     if dds:
         filt = ignorealt
+        tmpI = chans_names
+        noq = True
+    elif not complex:
+        filt = ignorevoltage
         tmpI = chans_names
         noq = True
     else:
@@ -49,51 +75,37 @@ def _sortconv(chans_names, noq=False, dds=False):
     tmpI = sorted(tmpI, key=filt)
     tmpQ = sorted(tmpQ, key=filt)
     for i in range(len(tmpI)):
-        chans_names_out.append(tmpI[i])
+        out.append(tmpI[i])
         if not noq:
-            chans_names_out.append(tmpQ[i])
-
-    return chans_names_out
+            out.append(tmpQ[i])
+    return out
 
 
 class ad9084(rx_tx, context_manager, sync_start):
-    """AD9084 Mixed-Signal Front End (MxFE)"""
+    """AD9084 Mixed-Signal Front End (MxFE) — single path (asym=0)
+
+    Mirrors ad9081 API with:
+        self._rxadc = "axi-ad9084-rx-hpc"
+        self._txdac = "axi-ad9084-tx-hpc"
+    """
 
     _complex_data = True
     _rx_channel_names: List[str] = []
-    _rx2_channel_names: List[str] = []
     _tx_channel_names: List[str] = []
-    _tx2_channel_names: List[str] = []
     _tx_control_channel_names: List[str] = []
     _rx_coarse_ddc_channel_names: List[str] = []
     _tx_coarse_duc_channel_names: List[str] = []
     _rx_fine_ddc_channel_names: List[str] = []
     _tx_fine_duc_channel_names: List[str] = []
     _dds_channel_names: List[str] = []
-    _dds2_channel_names: List[str] = []
     _device_name = ""
 
     _path_map: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
 
-    def __init__(
-        self,
-        uri="",
-        rx1_device_name="axi-ad9084-rx-hpc",
-        rx2_device_name="axi-ad9084b-rx-b",
-        tx1_device_name="axi-ad9084-tx-hpc",
-        tx2_device_name="axi-ad9084-tx-b",
-    ):
-        """Create a new instance of the AD9084 MxFE
+    def __init__(self, uri="",
+                 rx_device_name="axi-ad9084-rx-hpc",
+                 tx_device_name="axi-ad9084-tx-hpc"):
 
-        rx1_device_name is used as the name for the control device and RX1/TX1 data device
-
-        Args:
-            uri: URI of device
-            rx1_device_name: Name of RX1 device driver. Default is 'axi-ad9084-rx-hpc'
-            rx2_device_name: Name of RX2 device driver. Default is 'axi-ad9084b-rx-b'
-            tx1_device_name: Name of TX1 device driver. Default is 'axi-ad9084-tx-hpc'
-            tx2_device_name: Name of TX2 device driver. Default is 'axi-ad9084-tx-b'
-        """
         # Reset default channel lists
         self._rx_channel_names = []
         self._tx_channel_names = []
@@ -106,132 +118,113 @@ class ad9084(rx_tx, context_manager, sync_start):
 
         context_manager.__init__(self, uri, self._device_name)
         # Default device for attribute writes
-        self._ctrl = self._ctx.find_device(rx1_device_name)
+        self._ctrl = self._ctx.find_device(rx_device_name)
         # Devices with buffers
-        self._rxadc = self._ctx.find_device(rx1_device_name)
-        self._txdac = self._ctx.find_device(tx1_device_name)
-        self._rxadc2 = self._ctx.find_device(rx2_device_name)
-        self._txdac2 = self._ctx.find_device(tx2_device_name)
-        # Checks
-        for dev, name in zip(
-            [self._rxadc, self._txdac, self._rxadc2, self._txdac2],
-            [rx1_device_name, tx1_device_name, rx2_device_name, tx2_device_name],
-        ):
-            if dev is None:
-                raise Exception(f"No device found with name {name}")
+        self._rxadc = self._ctx.find_device(rx_device_name)
+        self._txdac = self._ctx.find_device(tx_device_name)
+        if self._rxadc is None:
+            raise Exception(f"No device found with name {rx_device_name}")
+        if self._txdac is None:
+            raise Exception(f"No device found with name {tx_device_name}")
 
-        # Get DDC and DUC mappings
+        # Update complex data flags (match ad9081)
+        if self._rx_complex_data is None:
+            self._rx_complex_data = are_channels_complex(self._rxadc.channels)
+        if self._tx_complex_data is None:
+            self._tx_complex_data = are_channels_complex(self._txdac.channels)
+
+        # Build DDC/DUC path map from labels
         paths = {}
-
         for ch in self._rxadc.channels:
             if "label" in ch.attrs:
                 paths = _map_to_dict(paths, ch)
         self._path_map = paths
 
-        # Get data + DDS channels
+        # Gather data + DDS channels
         for ch in self._rxadc.channels:
             if ch.scan_element and not ch.output:
                 self._rx_channel_names.append(ch._id)
-        for ch in self._rxadc2.channels:
-            if ch.scan_element and not ch.output:
-                self._rx2_channel_names.append(ch._id)
         for ch in self._txdac.channels:
             if ch.scan_element:
                 self._tx_channel_names.append(ch._id)
             else:
                 self._dds_channel_names.append(ch._id)
-        for ch in self._txdac2.channels:
-            if ch.scan_element:
-                self._tx2_channel_names.append(ch._id)
-            else:
-                self._dds2_channel_names.append(ch._id)
 
-        # Sort channel names
-        self._rx_channel_names = _sortconv(self._rx_channel_names)
-        self._rx2_channel_names = _sortconv(self._rx2_channel_names)
-        self._tx_channel_names = _sortconv(self._tx_channel_names)
-        self._tx2_channel_names = _sortconv(self._tx2_channel_names)
+        # Sort exactly like ad9081
+        self._rx_channel_names = _sortconv(
+            self._rx_channel_names, complex=self._rx_complex_data
+        )
+        self._tx_channel_names = _sortconv(
+            self._tx_channel_names, complex=self._tx_complex_data
+        )
         self._dds_channel_names = _sortconv(self._dds_channel_names, dds=True)
-        self._dds2_channel_names = _sortconv(self._dds2_channel_names, dds=True)
 
-        # Map unique attributes to channel properties
+        # Map unique attributes to channel properties (same logic as ad9081)
         self._rx_fine_ddc_channel_names = []
         self._rx_coarse_ddc_channel_names = []
         self._tx_fine_duc_channel_names = []
         self._tx_coarse_duc_channel_names = []
-
-        for side in paths:
-            for converter in paths[side]:
-                for cdc in paths[side][converter]:
-                    channels = []
-                    for fdc in paths[side][converter][cdc]:
-                        channels += paths[side][converter][cdc][fdc]["channels"]
-                    channels = [name for name in channels if "_i" in name]
-                    if "ADC" in converter:
-                        self._rx_coarse_ddc_channel_names.append(channels[0])
-                        self._rx_fine_ddc_channel_names += channels
-                    else:
-                        self._tx_coarse_duc_channel_names.append(channels[0])
-                        self._tx_fine_duc_channel_names += channels
-
-        # Setup second DMA path
-        self._rx2 = obs(self._ctx, self._rxadc2, self._rx2_channel_names)
-        setattr(ad9084, "rx1", rx1)
-        setattr(ad9084, "rx2", rx2)
-        remap(self._rx2, "rx_", "rx2_", type(self))
-
-        self._tx2 = tx_two(self._ctx, self._txdac2, self._tx2_channel_names)
-        setattr(ad9084, "tx1", tx1)
-        setattr(ad9084, "tx2", tx2)
-        remap(self._tx2, "tx_", "tx2_", type(self))
-        remap(self._tx2, "dds_", "dds2_", type(self))
+        for converter in paths:
+            for cdc in paths[converter]:
+                chans = []
+                for fdc in paths[converter][cdc]:
+                    chans += paths[converter][cdc][fdc]["channels"]
+                # keep one (I) per complex pair
+                chans = [n for n in chans if "_q" not in n and "voltage" in n]
+                if "ADC" in converter:
+                    self._rx_coarse_ddc_channel_names.append(chans[0])
+                    self._rx_fine_ddc_channel_names += chans
+                else:
+                    self._tx_coarse_duc_channel_names.append(chans[0])
+                    self._tx_fine_duc_channel_names += chans
 
         rx_tx.__init__(self)
         sync_start.__init__(self)
         self.rx_buffer_size = 2 ** 16
 
+    # ───────────────── Single-element helpers (match ad9081) ─────────────────
     def _get_iio_attr_str_single(self, channel_name, attr, output):
-        # This is overridden by subclasses
+        if isinstance(channel_name, list):
+            channel_name = channel_name[0]
         return self._get_iio_attr_str(channel_name, attr, output)
 
     def _set_iio_attr_str_single(self, channel_name, attr, output, value):
-        # This is overridden by subclasses
+        if isinstance(channel_name, list):
+            channel_name = channel_name[0]
         return self._set_iio_attr(channel_name, attr, output, value)
 
-    def _get_iio_attr_single(self, channel_name, attr, output):
-        # This is overridden by subclasses
-        return self._get_iio_attr(channel_name, attr, output)
+    def _get_iio_attr_single(self, channel_name, attr, output, _ctrl=None):
+        if isinstance(channel_name, list):
+            channel_name = channel_name[0]
+        return self._get_iio_attr(channel_name, attr, output, _ctrl)
 
-    def _set_iio_attr_single(self, channel_name, attr, output, value):
-        # This is overridden by subclasses
-        return self._set_iio_attr(channel_name, attr, output, value)
+    def _set_iio_attr_single(self, channel_name, attr, output, value, _ctrl=None):
+        if isinstance(channel_name, list):
+            channel_name = channel_name[0]
+        return self._set_iio_attr(channel_name, attr, output, value, _ctrl)
 
     def _get_iio_dev_attr_single(self, attr):
-        # This is overridden by subclasses
         return self._get_iio_dev_attr(attr)
 
     def _set_iio_dev_attr_single(self, attr, value):
-        # This is overridden by subclasses
         return self._set_iio_dev_attr(attr, value)
 
     def _get_iio_dev_attr_str_single(self, attr):
-        # This is overridden by subclasses
         return self._get_iio_dev_attr_str(attr)
 
     def _set_iio_dev_attr_str_single(self, attr, value):
-        # This is overridden by subclasses
         return self._set_iio_dev_attr_str(attr, value)
+
+    # ───────────────────────────── Public API ─────────────────────────────
 
     @property
     def path_map(self):
-        """path_map: Map of channelizers both coarse and fine to
-        individual driver channel names
-        """
+        """Map of channelizers (coarse & fine) to driver channel names"""
         return self._path_map
 
+    # RX fine/coarse DDC (freq/phase, test, zone, 6 dB gains)
     @property
     def rx_channel_nco_frequencies(self):
-        """rx_channel_nco_frequencies: Receive path fine DDC NCO frequencies"""
         return self._get_iio_attr_vec(
             self._rx_fine_ddc_channel_names, "channel_nco_frequency", False
         )
@@ -244,7 +237,6 @@ class ad9084(rx_tx, context_manager, sync_start):
 
     @property
     def rx_channel_nco_phases(self):
-        """rx_channel_nco_phases: Receive path fine DDC NCO phases"""
         return self._get_iio_attr_vec(
             self._rx_fine_ddc_channel_names, "channel_nco_phase", False
         )
@@ -252,12 +244,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @rx_channel_nco_phases.setter
     def rx_channel_nco_phases(self, value):
         self._set_iio_attr_int_vec(
-            self._rx_fine_ddc_channel_names, "channel_nco_phase", False, value,
+            self._rx_fine_ddc_channel_names, "channel_nco_phase", False, value
         )
 
     @property
     def rx_main_nco_frequencies(self):
-        """rx_main_nco_frequencies: Receive path coarse DDC NCO frequencies"""
         return self._get_iio_attr_vec(
             self._rx_coarse_ddc_channel_names, "main_nco_frequency", False
         )
@@ -265,12 +256,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @rx_main_nco_frequencies.setter
     def rx_main_nco_frequencies(self, value):
         self._set_iio_attr_int_vec(
-            self._rx_coarse_ddc_channel_names, "main_nco_frequency", False, value,
+            self._rx_coarse_ddc_channel_names, "main_nco_frequency", False, value
         )
 
     @property
     def rx_main_nco_phases(self):
-        """rx_main_nco_phases: Receive path coarse DDC NCO phases"""
         return self._get_iio_attr_vec(
             self._rx_coarse_ddc_channel_names, "main_nco_phase", False
         )
@@ -278,23 +268,23 @@ class ad9084(rx_tx, context_manager, sync_start):
     @rx_main_nco_phases.setter
     def rx_main_nco_phases(self, value):
         self._set_iio_attr_int_vec(
-            self._rx_coarse_ddc_channel_names, "main_nco_phase", False, value,
+            self._rx_coarse_ddc_channel_names, "main_nco_phase", False, value
         )
 
     @property
     def rx_test_mode(self):
-        """rx_test_mode: NCO Test Mode"""
-        return self._get_iio_attr_str_single("voltage0_i", "test_mode", False)
+        return self._get_iio_attr_str_single(
+            self._rx_coarse_ddc_channel_names, "test_mode", False
+        )
 
     @rx_test_mode.setter
     def rx_test_mode(self, value):
         self._set_iio_attr_single(
-            "voltage0_i", "test_mode", False, value,
+            self._rx_coarse_ddc_channel_names, "test_mode", False, value
         )
 
     @property
     def rx_nyquist_zone(self):
-        """rx_nyquist_zone: ADC nyquist zone. Options are: odd, even"""
         return self._get_iio_attr_str_vec(
             self._rx_coarse_ddc_channel_names, "nyquist_zone", False
         )
@@ -302,12 +292,98 @@ class ad9084(rx_tx, context_manager, sync_start):
     @rx_nyquist_zone.setter
     def rx_nyquist_zone(self, value):
         self._set_iio_attr_str_vec(
-            self._rx_coarse_ddc_channel_names, "nyquist_zone", False, value,
+            self._rx_coarse_ddc_channel_names, "nyquist_zone", False, value
+        )
+
+    # Optional 6 dB toggles (names aligned to ad9081)
+    @property
+    def rx_main_6dB_digital_gains(self):
+        return self._get_iio_attr_vec(
+            self._rx_coarse_ddc_channel_names, "main_6db_digital_gain_en", False
+        )
+
+    @rx_main_6dB_digital_gains.setter
+    def rx_main_6dB_digital_gains(self, value):
+        self._set_iio_attr_int_vec(
+            self._rx_coarse_ddc_channel_names, "main_6db_digital_gain_en", False, value
         )
 
     @property
+    def rx_channel_6dB_digital_gains(self):
+        return self._get_iio_attr_vec(
+            self._rx_fine_ddc_channel_names, "channel_6db_digital_gain_en", False
+        )
+
+    @rx_channel_6dB_digital_gains.setter
+    def rx_channel_6dB_digital_gains(self, value):
+        self._set_iio_attr_int_vec(
+            self._rx_fine_ddc_channel_names, "channel_6db_digital_gain_en", False, value
+        )
+
+    # RX FFH (match ad9081 names; safe no-op if attrs absent)
+    @property
+    def rx_main_nco_ffh_index(self):
+        return self._get_iio_attr_vec(
+            self._rx_coarse_ddc_channel_names, "main_nco_ffh_index", False
+        )
+
+    @rx_main_nco_ffh_index.setter
+    def rx_main_nco_ffh_index(self, value):
+        self._set_iio_attr_int_vec(
+            self._rx_coarse_ddc_channel_names, "main_nco_ffh_index", False, value
+        )
+
+    @property
+    def rx_main_nco_ffh_select(self):
+        return self._get_iio_attr_vec(
+            self._rx_coarse_ddc_channel_names, "main_nco_ffh_select", False
+        )
+
+    @rx_main_nco_ffh_select.setter
+    def rx_main_nco_ffh_select(self, value):
+        self._set_iio_attr_int_vec(
+            self._rx_coarse_ddc_channel_names, "main_nco_ffh_select", False, value
+        )
+
+    @property
+    def rx_main_ffh_mode(self):
+        return self._get_iio_attr_str_vec(
+            self._rx_coarse_ddc_channel_names, "main_ffh_mode", False
+        )
+
+    @rx_main_ffh_mode.setter
+    def rx_main_ffh_mode(self, value):
+        self._set_iio_attr_str_vec(
+            self._rx_coarse_ddc_channel_names, "main_ffh_mode", False, value
+        )
+
+    @property
+    def rx_main_ffh_trig_hop_en(self):
+        return self._get_iio_attr_vec(
+            self._rx_coarse_ddc_channel_names, "main_ffh_trig_hop_en", False
+        )
+
+    @rx_main_ffh_trig_hop_en.setter
+    def rx_main_ffh_trig_hop_en(self, value):
+        self._set_iio_attr_int_vec(
+            self._rx_coarse_ddc_channel_names, "main_ffh_trig_hop_en", False, value
+        )
+
+    @property
+    def rx_main_ffh_gpio_mode_enable(self):
+        return self._get_iio_attr_vec(
+            self._rx_coarse_ddc_channel_names, "main_ffh_gpio_mode_en", False
+        )
+
+    @rx_main_ffh_gpio_mode_enable.setter
+    def rx_main_ffh_gpio_mode_enable(self, value):
+        self._set_iio_attr_int_vec(
+            self._rx_coarse_ddc_channel_names, "main_ffh_gpio_mode_en", False, value
+        )
+
+    # TX fine/coarse DUC (freq/phase, test, gains, FFH)
+    @property
     def tx_channel_nco_frequencies(self):
-        """tx_channel_nco_frequencies: Transmit path fine DUC NCO frequencies"""
         return self._get_iio_attr_vec(
             self._tx_fine_duc_channel_names, "channel_nco_frequency", True
         )
@@ -320,7 +396,6 @@ class ad9084(rx_tx, context_manager, sync_start):
 
     @property
     def tx_channel_nco_phases(self):
-        """tx_channel_nco_phases: Transmit path fine DUC NCO phases"""
         return self._get_iio_attr_vec(
             self._tx_fine_duc_channel_names, "channel_nco_phase", True
         )
@@ -328,12 +403,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_channel_nco_phases.setter
     def tx_channel_nco_phases(self, value):
         self._set_iio_attr_int_vec(
-            self._tx_fine_duc_channel_names, "channel_nco_phase", True, value,
+            self._tx_fine_duc_channel_names, "channel_nco_phase", True, value
         )
 
     @property
     def tx_channel_nco_test_tone_en(self):
-        """tx_channel_nco_test_tone_en: Transmit path fine DUC NCO test tone enable"""
         return self._get_iio_attr_vec(
             self._tx_coarse_duc_channel_names, "channel_nco_test_tone_en", True
         )
@@ -341,12 +415,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_channel_nco_test_tone_en.setter
     def tx_channel_nco_test_tone_en(self, value):
         self._set_iio_attr_int_vec(
-            self._tx_coarse_duc_channel_names, "channel_nco_test_tone_en", True, value,
+            self._tx_coarse_duc_channel_names, "channel_nco_test_tone_en", True, value
         )
 
     @property
     def tx_channel_nco_test_tone_scales(self):
-        """tx_channel_nco_test_tone_scales: Transmit path fine DUC NCO test tone scale"""
         return self._get_iio_attr_vec(
             self._tx_coarse_duc_channel_names, "channel_nco_test_tone_scale", True
         )
@@ -354,15 +427,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_channel_nco_test_tone_scales.setter
     def tx_channel_nco_test_tone_scales(self, value):
         self._set_iio_attr_float_vec(
-            self._tx_coarse_duc_channel_names,
-            "channel_nco_test_tone_scale",
-            True,
-            value,
+            self._tx_coarse_duc_channel_names, "channel_nco_test_tone_scale", True, value
         )
 
     @property
     def tx_channel_nco_gain_scales(self):
-        """tx_channel_nco_gain_scales Transmit path fine DUC NCO gain scale"""
         return self._get_iio_attr_vec(
             self._tx_coarse_duc_channel_names, "channel_nco_gain_scale", True
         )
@@ -370,12 +439,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_channel_nco_gain_scales.setter
     def tx_channel_nco_gain_scales(self, value):
         self._set_iio_attr_float_vec(
-            self._tx_coarse_duc_channel_names, "channel_nco_gain_scale", True, value,
+            self._tx_coarse_duc_channel_names, "channel_nco_gain_scale", True, value
         )
 
     @property
     def tx_main_nco_frequencies(self):
-        """tx_main_nco_frequencies: Transmit path coarse DUC NCO frequencies"""
         return self._get_iio_attr_vec(
             self._tx_coarse_duc_channel_names, "main_nco_frequency", True
         )
@@ -383,12 +451,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_main_nco_frequencies.setter
     def tx_main_nco_frequencies(self, value):
         self._set_iio_attr_int_vec(
-            self._tx_coarse_duc_channel_names, "main_nco_frequency", True, value,
+            self._tx_coarse_duc_channel_names, "main_nco_frequency", True, value
         )
 
     @property
     def tx_main_nco_phases(self):
-        """tx_main_nco_phases: Transmit path coarse DUC NCO phases"""
         return self._get_iio_attr_vec(
             self._tx_coarse_duc_channel_names, "main_nco_phase", True
         )
@@ -396,12 +463,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_main_nco_phases.setter
     def tx_main_nco_phases(self, value):
         self._set_iio_attr_int_vec(
-            self._tx_coarse_duc_channel_names, "main_nco_phase", True, value,
+            self._tx_coarse_duc_channel_names, "main_nco_phase", True, value
         )
 
     @property
     def tx_main_nco_test_tone_en(self):
-        """tx_main_nco_test_tone_en: Transmit path coarse DUC NCO test tone enable"""
         return self._get_iio_attr_vec(
             self._tx_coarse_duc_channel_names, "main_nco_test_tone_en", True
         )
@@ -409,12 +475,11 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_main_nco_test_tone_en.setter
     def tx_main_nco_test_tone_en(self, value):
         self._set_iio_attr_int_vec(
-            self._tx_coarse_duc_channel_names, "main_nco_test_tone_en", True, value,
+            self._tx_coarse_duc_channel_names, "main_nco_test_tone_en", True, value
         )
 
     @property
     def tx_main_nco_test_tone_scales(self):
-        """tx_main_nco_test_tone_scales: Transmit path coarse DUC NCO test tone scale"""
         return self._get_iio_attr_vec(
             self._tx_coarse_duc_channel_names, "main_nco_test_tone_scale", True
         )
@@ -422,66 +487,120 @@ class ad9084(rx_tx, context_manager, sync_start):
     @tx_main_nco_test_tone_scales.setter
     def tx_main_nco_test_tone_scales(self, value):
         self._set_iio_attr_float_vec(
-            self._tx_coarse_duc_channel_names, "main_nco_test_tone_scale", True, value,
+            self._tx_coarse_duc_channel_names, "main_nco_test_tone_scale", True, value
+        )
+
+    # TX FFH (mirror ad9081)
+    @property
+    def tx_main_ffh_frequency(self):
+        return self._get_iio_attr_vec(
+            self._tx_coarse_duc_channel_names, "main_nco_ffh_frequency", True
+        )
+
+    @tx_main_ffh_frequency.setter
+    def tx_main_ffh_frequency(self, value):
+        self._set_iio_attr_int_vec(
+            self._tx_coarse_duc_channel_names, "main_nco_ffh_frequency", True, value
         )
 
     @property
-    def loopback_mode(self):
-        """loopback_mode: Enable loopback mode RX->TX
+    def tx_main_ffh_index(self):
+        return self._get_iio_attr_vec(
+            self._tx_coarse_duc_channel_names, "main_nco_ffh_index", True
+        )
 
-        When enabled JESD RX FIFO is connected to JESD TX FIFO,
-        making the entire datasource for the TX path the RX path. No
-        data is passed into the TX path from off-chip when 1. For
-        this mode to function correctly the JESD configuration
-        between RX and TX must be identical and only use a single
-        link.
-        """
-        return self._get_iio_dev_attr_single("loopback_mode")
-
-    @loopback_mode.setter
-    def loopback_mode(self, value):
-        self._set_iio_dev_attr_single(
-            "loopback_mode", value,
+    @tx_main_ffh_index.setter
+    def tx_main_ffh_index(self, value):
+        self._set_iio_attr_int_vec(
+            self._tx_coarse_duc_channel_names, "main_nco_ffh_index", True, value
         )
 
     @property
-    def tx_ddr_offload(self):
-        """tx_ddr_offload: Enable DDR offload
+    def tx_main_nco_ffh_select(self):
+        return self._get_iio_attr_vec(
+            self._tx_coarse_duc_channel_names, "main_nco_ffh_select", True
+        )
 
-        When true the DMA will pass buffers into the BRAM FIFO for data repeating.
-        This is necessary when operating at high DAC sample rates. This can reduce
-        the maximum buffer size but data passed to DACs in cyclic mode will not
-        underflow due to memory bottlenecks.
-        """
-        return self._get_iio_debug_attr("pl_ddr_fifo_enable", self._txdac)
+    @tx_main_nco_ffh_select.setter
+    def tx_main_nco_ffh_select(self, value):
+        self._set_iio_attr_int_vec(
+            self._tx_coarse_duc_channel_names, "main_nco_ffh_select", True, value
+        )
 
-    @tx_ddr_offload.setter
-    def tx_ddr_offload(self, value):
-        self._set_iio_debug_attr_str("pl_ddr_fifo_enable", str(value * 1), self._txdac)
+    @property
+    def tx_main_ffh_mode(self):
+        return self._get_iio_attr_str_vec(
+            self._tx_coarse_duc_channel_names, "main_ffh_mode", True
+        )
 
+    @tx_main_ffh_mode.setter
+    def tx_main_ffh_mode(self, value):
+        self._set_iio_attr_str_vec(
+            self._tx_coarse_duc_channel_names, "main_ffh_mode", True, value
+        )
+
+    @property
+    def tx_main_ffh_gpio_mode_enable(self):
+        # ad9081 uses a single channel for this; mirror that API
+        return self._get_iio_attr_single("voltage0_i", "main_ffh_gpio_mode_en", True)
+
+    @tx_main_ffh_gpio_mode_enable.setter
+    def tx_main_ffh_gpio_mode_enable(self, value):
+        self._set_iio_attr_single(
+            "voltage0_i", "main_ffh_gpio_mode_en", True, value
+        )
+
+    # DAC enable & full-scale current (match ad9081)
+    @property
+    def tx_dac_en(self):
+        return self._get_iio_attr_vec(self._tx_coarse_duc_channel_names, "en", True)
+
+    @tx_dac_en.setter
+    def tx_dac_en(self, value):
+        self._set_iio_attr_int_vec(
+            self._tx_coarse_duc_channel_names, "en", True, value
+        )
+
+    def set_tx_dac_full_scale_current(self, value):
+        # microamps, via debugfs like ad9081
+        self._set_iio_debug_attr_str(
+            "dac-full-scale-current-ua", str(value), self._rxadc
+        )
+
+    tx_dac_full_scale_current = property(None, set_tx_dac_full_scale_current)
+
+    # Sample-rate / clocks (identical semantics to ad9081)
     @property
     def rx_sample_rate(self):
-        """rx_sampling_frequency: Sample rate after decimation"""
-        return self._get_iio_attr_single("voltage0_i", "sampling_frequency", False)
+        """Sample rate after decimation"""
+        return self._get_iio_attr_single(
+            self._rx_coarse_ddc_channel_names, "sampling_frequency", False
+        )
 
     @property
     def adc_frequency(self):
-        """adc_frequency: ADC frequency in Hz"""
-        return self._get_iio_attr_single("voltage0_i", "adc_frequency", False)
+        """ADC frequency in Hz"""
+        return self._get_iio_attr_single(
+            self._rx_coarse_ddc_channel_names, "adc_frequency", False
+        )
 
     @property
     def tx_sample_rate(self):
-        """tx_sampling_frequency: Sample rate before interpolation"""
-        return self._get_iio_attr_single("voltage0_i", "sampling_frequency", True)
+        """Sample rate before interpolation"""
+        return self._get_iio_attr_single(
+            self._tx_coarse_duc_channel_names, "sampling_frequency", True
+        )
 
     @property
     def dac_frequency(self):
-        """dac_frequency: DAC frequency in Hz"""
-        return self._get_iio_attr_single("voltage0_i", "dac_frequency", True)
+        """DAC frequency in Hz"""
+        return self._get_iio_attr_single(
+            self._tx_coarse_duc_channel_names, "dac_frequency", True
+        )
 
+    # JESD / status (unchanged)
     @property
     def jesd204_fsm_ctrl(self):
-        """jesd204_fsm_ctrl: jesd204-fsm control"""
         return self._get_iio_dev_attr("jesd204_fsm_ctrl", self._rxadc)
 
     @jesd204_fsm_ctrl.setter
@@ -490,7 +609,6 @@ class ad9084(rx_tx, context_manager, sync_start):
 
     @property
     def jesd204_fsm_resume(self):
-        """jesd204_fsm_resume: jesd204-fsm resume"""
         return self._get_iio_dev_attr("jesd204_fsm_resume", self._rxadc)
 
     @jesd204_fsm_resume.setter
@@ -499,32 +617,23 @@ class ad9084(rx_tx, context_manager, sync_start):
 
     @property
     def jesd204_fsm_state(self):
-        """jesd204_fsm_state: jesd204-fsm state"""
         return self._get_iio_dev_attr_str("jesd204_fsm_state", self._rxadc)
 
     @property
     def jesd204_fsm_paused(self):
-        """jesd204_fsm_paused: jesd204-fsm paused"""
         return self._get_iio_dev_attr("jesd204_fsm_paused", self._rxadc)
 
     @property
     def jesd204_fsm_error(self):
-        """jesd204_fsm_error: jesd204-fsm error"""
         return self._get_iio_dev_attr("jesd204_fsm_error", self._rxadc)
 
     @property
     def jesd204_device_status(self):
-        """jesd204_device_status: Device jesd204 link status information"""
         return self._get_iio_debug_attr_str("status", self._rxadc)
 
     @property
     def jesd204_device_status_check(self):
-        """jesd204_device_status_check: Device jesd204 link status check
-
-        Returns 'True' in case error conditions are detected, 'False' otherwise
-        """
         stat = self._get_iio_debug_attr_str("status", self._rxadc)
-
         for s in stat.splitlines(0):
             if "JRX" in s:
                 if "204C" in s:
@@ -534,19 +643,24 @@ class ad9084(rx_tx, context_manager, sync_start):
                     if "0x0 lanes in DATA" in s:
                         return True
             elif "JTX" in s:
-                if any(
-                    substr in s
-                    for substr in [" asserted", "unlocked", "lost", "invalid"]
-                ):
+                if any(substr in s for substr in
+                       [" asserted", "unlocked", "lost", "invalid"]):
                     return True
         return False
 
     @property
     def chip_version(self):
-        """chip_version: Chip version information"""
         return self._get_iio_debug_attr_str("chip_version", self._rxadc)
 
     @property
     def api_version(self):
-        """api_version: API version"""
         return self._get_iio_debug_attr_str("api_version", self._rxadc)
+
+    # Optional: powerdown (same as ad9081) if your driver exposes it
+    @property
+    def powerdown(self):
+        return self._get_iio_dev_attr_single("powerdown")
+
+    @powerdown.setter
+    def powerdown(self, value):
+        self._set_iio_dev_attr_single("powerdown", value)
